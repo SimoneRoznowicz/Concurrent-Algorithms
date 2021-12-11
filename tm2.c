@@ -251,3 +251,39 @@ chance to take advantage of their full runtime quantum
 	}	
 }
 
+void leave((struct batcher)* batcher, (struct region)* region, tx_t tx) {
+	unsigned long attempt=atomic_fetch_add_explicit(&(batcher->permission),1,memory_order_relaxed);
+        //keep iterating until the value of the obtained attempt corresponds to the pass
+        while(atomic_load_explicit()!=){
+                //PAUSE FOR SOME INSTANTS
+	}
+	//beginning, acquire
+	atomic_thread_fence(memory_order_acquire);
+	//if I have at least one writing operarion inside the batcher
+	if(aromic_fetch_add_explicit(&batcher->num_entered_proc,-1,memory_order_relaxed)==1){
+		if(atomic_load_explicit(&(batcher->num_writing_proc),memory_order_relaxed)>0)
+			commit(region); //commit the operation and add 1 epoch(one operation concluded)
+			atomic_fetch_add_explicit(&(batcher->epoch),1,memory_order_relaxed);
+			//restore initial values
+			atomic_store_explicit(&(batcher->nb_write_tx),0,memory_order_relaxed);
+        	    	atomic_store_explicit(&(batcher->counter),BATCHER_NB_TX, memory_order_relaxed);
+		}
+		atomic_fetch_add_explicit(&(batcher->pass),1,memory_order_release);
+	}
+	else if(tx!=read_only_tx){
+		unsigned long int epoch = atomic_load_explicit(&(batcher->epoch), memory_order_relaxed);
+        	atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
+
+        	while (atomic_load_explicit(&(batcher->epoch), memory_order_relaxed) == epoch)
+            		pause();
+    		} 
+		else {
+        		atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
+    		}
+	}
+}
+
+
+
+
+
