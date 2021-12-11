@@ -79,10 +79,10 @@ static inline void pause() {
 
 // -------------------------------------------------------------------------- //
 
-#define DEFAULT_FLAG 0
-#define REMOVED_FLAG 1
-#define ADDED_FLAG 2
-#define ADDED_REMOVED_FLAG 3
+#define DEFAULT 0
+#define REMOVED 1
+#define ADDED 2
+#define ADDED_REMOVED 3
 
 #define BATCHER_NB_TX 12ul
 #define MULTIPLE_READERS UINTPTR_MAX - BATCHER_NB_TX
@@ -92,6 +92,7 @@ static const tx_t destroy_tx = UINTPTR_MAX - 2ul;
 
 struct map_elem{
 	size_t size=0;
+	void* ptr;
 
 
 
@@ -111,13 +112,15 @@ struct batcher{
 	atomic_ulong num_writing_proc;
 	atomic_ulong epoch;
 	atomic_ulong acquire_lock;
-	atomic_ulong ticket;
+	atomic_ulong attempt;
 };
 
 struct region{
 	size_t align;
+	size_t align_real;
 	struct batcher batcher;
-	struct map_elem map_elem;
+	(struct map_elem)* map_elem;	//array of map_elem
+	atomic_ulong  index;
 
 
 
@@ -130,7 +133,7 @@ void get_new_batcher((struct batcher)* batcher){
 	batcher->num_writing_proc=0;
 	batcher->epoch=0;
 	batcher->aquire_lock=0;
-	batcher->ticket=0;
+	batcher->permission=0;
 }
 
 shared_t tm_create(size_t size, size_t align){
@@ -138,16 +141,113 @@ shared_t tm_create(size_t size, size_t align){
 	if(unlikely(region==NULL)){
 		return invalid_shared;
 	}
-	region->index=1; //index 0 memory is reserved
-	size_t real_align=align>sizeof(void*)?align:sizeof(void*);//boh questo non so... Io terrei anche solo align
-	size_t size=real_align*
+	region->index=1; //index 0 memory isi reserved
+	region->map_elem=malloc(getpagesize());
+	memset(region->map_elem,0,getpagesize());
+	if(unlikely(region->map_elem==NULL)){
+		return invalid_shared;
+	}
+	size_t align_real=align > sizeof(void*)? align : sizeof(void*);//boh questo non so... Io terrei anche solo align
+
+	//initialize the remaining values of region->map_elem->...
+	region->map_elem->size=size;
+	region->map_elem->my_status=0;
+	region->map_elem->status=DEFAULT;
+	region->align_real=align_real;
+	region->align=align;
+	get_new_batcher(&(region->batcher));
+	return region;
 };
 
+void tm_destroy(shared_t shared) {
+	(struct region)* region=(struct region*) shared;
+	for(int i=0;i<region->map_elem;i++){
+		free(region->map_elem[i].ptr);
+	}
+}
 
+void *tm_start(shared_t shared){
+    return (((struct region)*)shared)->map_elem->ptr;
+}
 
+size_t tm_size(shared_t shared){
+    return (((struct region)*)shared)->map_elem->size;
+}
 
+size_t tm_align(shared_t shared){
+    return (((struct region)*)shared)->align_real;
+}
 
+tx_t tm_begin(shared_t shared,bool is_ro){
+    return enter(&((((struct region)*)shared)->batcher), is_ro);
+}
 
+bool tm_end(shared_t shared,tx_t tx){
+    leave(&(((struct region)*)shared)->batcher,((struct region)*)shared,tx);
+    return true;
+}
 
+bool tm_free(shared_t shared,tx_t tx,void *segment){
+    struct map_elem* map_elem = get_segment(((struct region)*)shared,segment);
+    tx_t previous = 0;
+    if (mapping == NULL || !(atomic_compare_exchange_strong(&mapping->status_owner,&previous,tx) || previous == tx)) {
+        tm_rollback(((struct region)*)shared,tx);
+        return false; //need to roolback since the transaction was not committed 
+    }
+    if (map_elem->status == ADDED) {
+        map_elem->>status = ADDED_REMOVED;
+    }
+    else {
+        map_elem->status = REMOVED;
+    }
+    return true; //the transaction finished positively, can go on
+}
 
+tx_t enter(struct batcher* batcher,bool is_ro){
+	if(is_ro){
+		unsigned long attempt=atomic_fetch_add_explicit(&(batcher->permission),1,memory_order_relaxed);/*On a multi-core/multi-CPU systems, with plenty of locks that are held for a very short amount 
+of time only, the time wasted for constantly putting threads to sleep and waking them up again 
+might decrease runtime performance noticeably. When using spinlocks instead, threads get the 
+chance to take advantage of their full runtime quantum
+		*/
+		//keep iterating until the value of the obtained attempt corresponds to the pass
+		while(atomic_load_explicit()!=){
+			//PAUSE FOR SOME INSTANTS
+		}
+		//beginning, acquire
+		atomic_thread_fence(memory_order_acquire);
+		atomic_fetch_add_explicit(&(batcher->num_entered_proc),1,memory_order_relaxed);
+		atomic_fetch_add_explicit(&(batcher->pass),1,memory_order_relaxed);
+		//end, release
+		return read_only_tx;
+	}
+	else{ //one or more processes write
+		while (true) {
+            		unsigned long attempt = atomic_fetch_add_explicit(&(batcher->),1, memory_order_relaxed);
+            		//spinning locks again
+			while (atomic_load_explicit(&(batcher->pass),memory_order_relaxed) != ticket)
+                		pause();
+            		atomic_thread_fence(memory_order_acquire);
+			if (atomic_load_explicit(&(batcher->counter),memory_order_relaxed) == 0) {
+                	unsigned long int epoch = atomic_load_explicit(&(batcher->epoch), memory_order_relaxed);
+                	atomic_fetch_add_explicit(&(batcher->pass),1,memory_order_release);
+			//spinning locks again
+                	while (atomic_load_explicit(&(batcher->epoch),memory_order_relaxed) == epoch)
+                    		pause();
+                	atomic_thread_fence(memory_order_acquire);
+			}
+		       	else {
+                		atomic_fetch_add_explicit(&(batcher->counter),-1,memory_order_release);
+                		break;
+            		}
+		}
+		atomic_fetch_add_explicit(&(batcher->nb_entered),1,memory_order_relaxed);
+        	atomic_fetch_add_explicit(&(batcher->pass),1,memory_order_release);
+        	tx_t tx = atomic_fetch_add_explicit(&(batcher->nb_write_tx),1,memory_order_relaxed) + 1;
+        	atomic_thread_fence(memory_order_release);
+		print("Inside enter, not ro: tx == ");
+		print(tx);
+        	return tx;		//return the number of the transaction
+	}	
+}
 
