@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
+//#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h> //TODO: REMOVE FOR DEBUG PURPOSES
@@ -91,19 +92,10 @@ static const tx_t read_only_tx = UINTPTR_MAX - 1ul;
 static const tx_t destroy_tx = UINTPTR_MAX - 2ul;
 
 struct map_elem{
-	size_t size=0;
+	size_t size;
 	void* ptr;
-
-
-
-};
-
-struct region{
-	size_t align=0;
-	struct batcher batcher;
-
-
-
+	_Atomic (tx_t) my_status;
+	_Atomic (int) status;
 };
 
 struct batcher{
@@ -112,32 +104,28 @@ struct batcher{
 	atomic_ulong num_writing_proc;
 	atomic_ulong epoch;
 	atomic_ulong acquire_lock;
-	atomic_ulong attempt;
+	atomic_ulong permission;
 };
 
 struct region{
 	size_t align;
 	size_t align_real;
+	atomic_ulong index;
 	struct batcher batcher;
-	(struct map_elem)* map_elem;	//array of map_elem
-	atomic_ulong  index;
-
-
-
-
+	struct map_elem* map_elem;	//array of map_elem
 };
 
-void get_new_batcher((struct batcher)* batcher){
-	batcher->counter=0;
+void get_new_batcher(struct batcher* batcher){
+	batcher->counter=BATCHER_NB_TX;
 	batcher->num_entered_proc=0;
 	batcher->num_writing_proc=0;
 	batcher->epoch=0;
-	batcher->aquire_lock=0;
+	batcher->acquire_lock=0;  //take the lock
 	batcher->permission=0;
 }
 
 shared_t tm_create(size_t size, size_t align){
-	(struct region)* region=(struct region)* malloc(sizeof(region));
+	struct region* region=(struct region*) malloc(sizeof(region));
 	if(unlikely(region==NULL)){
 		return invalid_shared;
 	}
@@ -160,7 +148,7 @@ shared_t tm_create(size_t size, size_t align){
 };
 
 void tm_destroy(shared_t shared) {
-	(struct region)* region=(struct region*) shared;
+	struct region* region=(struct region*) shared;
 	for(size_t i=0;i<region->index;i++){
 		free(region->map_elem[i].ptr);
 	}
@@ -170,71 +158,58 @@ void tm_destroy(shared_t shared) {
 
 }
 
+struct map_elem* get_segment(struct region* region,const void* source) {
+   //I am looking for the map_elem which points to an area of memory which correspond to a piece of memory pointed by source*.
+    for (size_t i = 0;i < region->index;++i) {
+        char* start = (char*) region->map_elem[i].ptr;
+        if ((char*) source >= start && (char*) source < start + region->map_elem[i].size) {
+                //if source points a memory area between the pointer of the map_elem block and its endind ()
+                return region->map_elem+i;
+        }
+    }
+    return NULL;
+}
+
 void *tm_start(shared_t shared){
-    return (((struct region)*)shared)->map_elem->ptr;
+    return ((struct region*)shared)->map_elem->ptr;
 }
 
 size_t tm_size(shared_t shared){
-    return (((struct region)*)shared)->map_elem->size;
+    return ((struct region*)shared)->map_elem->size;
 }
 
 size_t tm_align(shared_t shared){
-    return (((struct region)*)shared)->align_real;
+    return ((struct region*)shared)->align_real;
 }
 
-tx_t tm_begin(shared_t shared,bool is_ro){
-    return enter(&((((struct region)*)shared)->batcher), is_ro);
-}
-
-bool tm_end(shared_t shared,tx_t tx){
-    leave(&(((struct region)*)shared)->batcher,((struct region)*)shared,tx);
-    return true;
-}
-
-bool tm_free(shared_t shared,tx_t tx,void *segment){
-    struct map_elem* map_elem = get_segment(((struct region)*)shared,segment);
-    tx_t previous = 0;
-    if (mapping == NULL || !(atomic_compare_exchange_strong(&mapping->status_owner,&previous,tx) || previous == tx)) {
-        tm_rollback(((struct region)*)shared,tx);
-        return false; //need to roolback since the transaction was not committed 
-    }
-    if (map_elem->status == ADDED) {
-        map_elem->>status = ADDED_REMOVED;
-    }
-    else {
-        map_elem->status = REMOVED;
-    }
-    return true; //the transaction finished positively, can go on
-}
-
-tx_t enter(struct batcher* batcher,bool is_ro){
+tx_t enter(struct batcher *batcher, bool is_ro) {
 	if(is_ro){
-		unsigned long attempt=atomic_fetch_add_explicit(&(batcher->permission),1,memory_order_relaxed);/*On a multi-core/multi-CPU systems, with plenty of locks that are held for a very short amount 
+		unsigned long attempt=atomic_fetch_add_explicit(&(batcher->acquire_lock),1,memory_order_relaxed);/*On a multi-core/multi-CPU systems, with plenty of locks that are held for a very short amount 
 of time only, the time wasted for constantly putting threads to sleep and waking them up again 
 might decrease runtime performance noticeably. When using spinlocks instead, threads get the 
 chance to take advantage of their full runtime quantum
 		*/
 		//keep iterating until the value of the obtained attempt corresponds to the pass
-		while(atomic_load_explicit()!=){
-			//PAUSE FOR SOME INSTANTS
+		while(atomic_load_explicit(&(batcher->permission), memory_order_relaxed) != attempt){
+			pause();
 		}
 		//beginning, acquire
 		atomic_thread_fence(memory_order_acquire);
 		atomic_fetch_add_explicit(&(batcher->num_entered_proc),1,memory_order_relaxed);
-		atomic_fetch_add_explicit(&(batcher->pass),1,memory_order_relaxed);
+		atomic_fetch_add_explicit(&(batcher->permission),1,memory_order_relaxed);
 		//end, release
 		return read_only_tx;
 	}
 	else{ //one or more processes write
 		while (true) {
-            		unsigned long attempt = atomic_fetch_add_explicit(&(batcher->),1, memory_order_relaxed);
+            		unsigned long attempt = atomic_fetch_add_explicit(&(batcher->acquire_lock),1, memory_order_relaxed);
             		//spinning locks again
-			while (atomic_load_explicit(&(batcher->pass),memory_order_relaxed) != ticket)
+			while (atomic_load_explicit(&(batcher->permission),memory_order_relaxed) != attempt)
                 		pause();
             		atomic_thread_fence(memory_order_acquire);
 			if (atomic_load_explicit(&(batcher->counter),memory_order_relaxed) == 0) {
                 	unsigned long int epoch = atomic_load_explicit(&(batcher->epoch), memory_order_relaxed);
-                	atomic_fetch_add_explicit(&(batcher->pass),1,memory_order_release);
+                	atomic_fetch_add_explicit(&(batcher->permission),1,memory_order_release);
 			//spinning locks again
                 	while (atomic_load_explicit(&(batcher->epoch),memory_order_relaxed) == epoch)
                     		pause();
@@ -245,108 +220,176 @@ chance to take advantage of their full runtime quantum
                 		break;
             		}
 		}
-		atomic_fetch_add_explicit(&(batcher->nb_entered),1,memory_order_relaxed);
-        	atomic_fetch_add_explicit(&(batcher->pass),1,memory_order_release);
-        	tx_t tx = atomic_fetch_add_explicit(&(batcher->nb_write_tx),1,memory_order_relaxed) + 1;
+		atomic_fetch_add_explicit(&(batcher->num_entered_proc),1,memory_order_relaxed);
+        	atomic_fetch_add_explicit(&(batcher->permission),1,memory_order_release);
+        	tx_t tx = atomic_fetch_add_explicit(&(batcher->num_writing_proc),1,memory_order_relaxed) + 1;
         	atomic_thread_fence(memory_order_release);
-		print("Inside enter, not ro: tx == ");
-		print(tx);
+	
         	return tx;		//return the number of the transaction
 	}	
 }
 
-void leave((struct batcher)* batcher, (struct region)* region, tx_t tx) {
-	unsigned long attempt=atomic_fetch_add_explicit(&(batcher->permission),1,memory_order_relaxed);
-        //keep iterating until the value of the obtained attempt corresponds to the pass
-        while(atomic_load_explicit()!=){
-                //PAUSE FOR SOME INSTANTS
-	}
-	//beginning, acquire
-	atomic_thread_fence(memory_order_acquire);
-	//if I have at least one writing operarion inside the batcher
-	if(aromic_fetch_add_explicit(&batcher->num_entered_proc,-1,memory_order_relaxed)==1){
-		if(atomic_load_explicit(&(batcher->num_writing_proc),memory_order_relaxed)>0)
-			commit(region); //commit the operation and add 1 epoch(one operation concluded)
-			atomic_fetch_add_explicit(&(batcher->epoch),1,memory_order_relaxed);
-			//restore initial values
-			atomic_store_explicit(&(batcher->nb_write_tx),0,memory_order_relaxed);
-        	    	atomic_store_explicit(&(batcher->counter),BATCHER_NB_TX, memory_order_relaxed);
-		}
-		atomic_fetch_add_explicit(&(batcher->pass),1,memory_order_release);
-	}
-	else if(tx!=read_only_tx){
-		unsigned long int epoch = atomic_load_explicit(&(batcher->epoch), memory_order_relaxed);
-        	atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
-
-        	while (atomic_load_explicit(&(batcher->epoch), memory_order_relaxed) == epoch)
-            		pause();
-    		} 
-		else {
-        		atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
-    		}
-	}
+tx_t tm_begin(shared_t shared,bool is_ro){
+    return enter(&(((struct region*)shared)->batcher), is_ro);
 }
 
-void batch_commit(struct region *region) {
-	atomic_thread_fence(memory_order_acquire);
-	for (size_t i = region->index - 1ul; i < region->index; --i) {
-        struct mapping_entry *mapping = region->mapping + i;
+void commit(struct region *region) {
+        atomic_thread_fence(memory_order_acquire);
+        for (size_t i = region->index - 1ul; i < region->index; --i) {
+        struct map_elem *map_elem = region->map_elem + i;
 
-        if (mapping->status_owner == destroy_tx ||
-            (mapping->status_owner != 0 && (
-                    mapping->status == REMOVED_FLAG || mapping->status == ADDED_REMOVED_FLAG)
+        if (map_elem->my_status == destroy_tx ||
+            (map_elem->my_status != 0 && (
+                    map_elem->status == REMOVED || map_elem->status == ADDED_REMOVED)
             )
                 ) {
             // Free this block
             unsigned long int previous = i + 1;
-	    if (atomic_compare_exchange_weak(&(region->index), &previous, i)) {
-                free(mapping->ptr);
-                mapping->ptr = NULL;
-                mapping->status = DEFAULT_FLAG;
-                mapping->status_owner = 0;
+            if (atomic_compare_exchange_weak(&(region->index), &previous, i)) {
+                free(map_elem->ptr);
+                map_elem->ptr = NULL;
+                map_elem->status = DEFAULT;
+                map_elem->my_status = 0;
             } else {
-                mapping->status_owner = destroy_tx;
-                mapping->status = DEFAULT_FLAG;
+                map_elem->my_status = destroy_tx;
+                map_elem->status = DEFAULT;
             }
-	    } else {
-            mapping->status_owner = 0;
-            mapping->status = DEFAULT_FLAG;
+            } else {
+            map_elem->my_status = 0;
+            map_elem->status = DEFAULT;
 
             // Commit changes
-            memcpy(mapping->ptr, ((char *) mapping->ptr) + mapping->size, mapping->size);
+            memcpy(map_elem->ptr, ((char *) map_elem->ptr) + map_elem->size, map_elem->size);
 
             // Reset locks
-            memset(((char *) mapping->ptr) + 2 * mapping->size, 0, mapping->size / region->align * sizeof(tx_t));
+            memset(((char *) map_elem->ptr) + 2 * map_elem->size, 0, map_elem->size / region->align * sizeof(tx_t));
         }
     }
     atomic_thread_fence(memory_order_release);
 }
 
-struct map_elem* get_segment((struct region)* region,const void* source) {
-   //I am looking for the map_elem which points to an area of memory which correspond to a piece of memory pointed by source*. 
-    for (size_t i = 0;i < region->index;++i) {
-        char* start = (char*) region->map_elem[i].ptr;
-        if ((char*) source >= start && (char*) source < start + region->mapping[i].size) {
-		//if source points a memory area between the pointer of the map_elem block and its endind ()
-		return region->map_elem+i;
-	}
-    } 
-    return NULL;
+alloc_t tm_alloc(shared_t shared,tx_t tx,size_t size, void** target){
+        struct region* region=(struct region*)shared;
+	//increment index,create a pointer to the next available area of memmory  and set the variables of that map_element
+        unsigned long int index=atomic_fetch_add_explicit(&(region->index),1,memory_order_relaxed);
+        struct map_elem* map_elem=region->map_elem+index;
+        map_elem->status=ADDED;
+        map_elem->my_status=tx;  //set tx a the transaction to use
+        void* ptr=NULL;
+        memset(ptr,0,2*size+(size/(region->align_real)*sizeof(tx_t)));
+        map_elem->ptr=ptr;
+        *target=ptr;
+        return success_alloc;
 }
 
-alloc_t tm_alloc(shared_t shared,tx_t tx,size_t size, void** target){
-	(struct region)* region=((struct region)*)shared;
-	//increment index,create a pointer to the next available area of memmory  and set the variables of that map_element
-	unsigned long int index=atomic_fetch_add_explicit((&(region->index,)),memory_order_relaxed);
-	struct map_elem* map_elem=region->map_elem+index;
-	map_elem->status=ADDED;
-	map_elem->my_status=tx;  //set tx a the transaction to use
+
+void leave(struct batcher* batcher,struct region* region,tx_t tx) {
+	unsigned long attempt=atomic_fetch_add_explicit(&(batcher->acquire_lock),1,memory_order_relaxed);
+        //keep iterating until the value of the obtained attempt corresponds to the pass
+        while(atomic_load_explicit(&(batcher->permission), memory_order_relaxed) != attempt){
+                pause();
+	}
+	//beginning, acquire
+	atomic_thread_fence(memory_order_acquire);
+	//if I have at least one writing operarion inside the batcher
+	if(atomic_fetch_add_explicit(&batcher->num_entered_proc,-1,memory_order_relaxed)==1){
+		if(atomic_load_explicit(&(batcher->num_writing_proc),memory_order_relaxed)>0){
+			commit(region); //commit the operation and add 1 epoch(one operation concluded)
+			atomic_fetch_add_explicit(&(batcher->epoch),1,memory_order_relaxed);
+			//restore initial values
+			atomic_store_explicit(&(batcher->num_writing_proc),0,memory_order_relaxed);
+        	    	atomic_store_explicit(&(batcher->counter),BATCHER_NB_TX, memory_order_relaxed);
+		}
+		atomic_fetch_add_explicit(&(batcher->permission),1,memory_order_release);
+	}
+	else if(tx!=read_only_tx){
+		unsigned long int epoch = atomic_load_explicit(&(batcher->epoch), memory_order_relaxed);
+        	atomic_fetch_add_explicit(&(batcher->permission), 1, memory_order_release);
+
+        	while (atomic_load_explicit(&(batcher->epoch), memory_order_relaxed) == epoch)
+            		pause();
+    		} 
+		else {
+        		atomic_fetch_add_explicit(&(batcher->permission), 1, memory_order_release);
+    		}
 	
-	memset(ptr,0,2*size+(size/(region->align_real)*sizeof(tx_t)));
-	map_elem->ptr=ptr;
-	*target=ptr;
-	return success_alloc;
 }
+
+bool tm_end(shared_t shared,tx_t tx){
+    leave(&((struct region*)shared)->batcher,(struct region*)shared,tx);
+    return true;
+}
+
+void tm_rollback(struct region* region,tx_t tx){
+unsigned long int index = region->index;
+    for (size_t i = 0; i < index; ++i) {
+        struct map_elem* map_elem = region->map_elem + i;
+
+        tx_t owner = map_elem->my_status;
+        if (owner == tx && (map_elem->status == ADDED || map_elem->status == ADDED_REMOVED)) {
+            map_elem->my_status = destroy_tx;
+        } else if (likely(owner != destroy_tx && map_elem->ptr != NULL)) {
+                if (owner == tx) {
+                map_elem->status = DEFAULT;
+                map_elem->my_status = 0;
+            }
+
+            size_t align = region->align;
+            size_t size = map_elem->size;
+            size_t nb = map_elem->size / region->align;
+            char *ptr = map_elem->ptr;
+            _Atomic (tx_t) volatile *controls = (_Atomic (tx_t) volatile *) (ptr + 2 * size);
+            for (size_t j = 0; j < nb; ++j) {
+                if (controls[j] == tx) {
+                    memcpy(ptr + j * align + size, ptr + j * align, align);
+                    controls[j] = 0;
+                } else {
+                    tx_t previous = 0 - tx;
+                    atomic_compare_exchange_weak(controls + j, &previous, 0);
+                }
+                atomic_thread_fence(memory_order_release);
+            }
+        }
+    }
+    leave(&(region->batcher),region,tx);
+}
+
+bool tm_read_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target) {
+    struct region* region = (struct region *) shared;
+    struct map_elem* map_elem = get_segment(region, source);
+    if (unlikely(map_elem == NULL)) {
+        // printf("Rollback in read !!!");
+        tm_rollback(region, tx);
+        return false;
+    }
+    size_t align = region->align_real;
+    size_t index = ((char *) source - (char *) map_elem->ptr) / align;
+    size_t nb = size / align;
+
+    _Atomic (tx_t) volatile *controls = ((_Atomic (tx_t) volatile *) (map_elem->ptr + map_elem->size * 2)) + index;
+
+    atomic_thread_fence(memory_order_acquire);
+    // Read the data
+    for (size_t i = 0; i < nb; ++i) {
+        tx_t no_owner = 0;
+        tx_t owner = atomic_load(controls + i);
+        if (owner == tx) {
+            memcpy(((char *) target) + i * align, ((char *) source) + i * align + map_elem->size, align);
+        }
+        else if (atomic_compare_exchange_strong(controls + i, &no_owner, 0 - tx) ||
+                   no_owner == 0ul - tx || no_owner == MULTIPLE_READERS ||
+                   (no_owner > MULTIPLE_READERS &&
+                    atomic_compare_exchange_strong(controls + i, &no_owner, MULTIPLE_READERS))) {
+                 memcpy(((char *) target) + i * align, ((char *) source) + i * align, align);
+        }
+        else {
+            tm_rollback(region, tx);
+            return false;
+        }
+    }
+    return true;
+}
+
 
 bool tm_read(shared_t shared,tx_t tx,void const *source,size_t size,void *target){
 	if(tx==read_only_tx){	//read only, easy xcase
@@ -354,13 +397,13 @@ bool tm_read(shared_t shared,tx_t tx,void const *source,size_t size,void *target
 		return true;
 	}
 	else{
-		//DO SOMETHING 	
+		return tm_read_write(shared, tx, source, size, target);
 	}
 }
 
 bool tm_write(shared_t shared,tx_t tx,void const *source,size_t size,void *target){
-	(struct region)* region=((struct region)*)shared;
-	struct map_elem* map_elem=get_elem(region,target);  //look for the specific map_elem according to the given target
+	struct region* region=(struct region*)shared;
+	struct map_elem* map_elem=get_segment(region,target);  //look for the specific map_elem according to the given target
 	if(map_elem==NULL){ 
 		tm_rollback(region,tx);
 		return false;
@@ -370,7 +413,42 @@ bool tm_write(shared_t shared,tx_t tx,void const *source,size_t size,void *targe
 	return true;
 }
 
+bool tm_free(shared_t shared,tx_t tx,void *segment){
+    struct map_elem* map_elem = get_segment((struct region*)shared,segment);
+    tx_t previous = 0;
+    if (map_elem == NULL || !(atomic_compare_exchange_strong(&map_elem->my_status,&previous,tx) || previous == tx)) {
+        tm_rollback((struct region*)shared,tx);
+        return false; //need to roolback since the transaction was not committed 
+    }
+    if (map_elem->status == ADDED) {
+        map_elem->status = ADDED_REMOVED;
+    }
+    else {
+        map_elem->status = REMOVED;
+    }
+    return true; //the transaction finished positively, can go on
+}
+
+bool lock_words(struct region* region,tx_t tx,struct map_elem*map_elem, void* target, size_t size) {
+    size_t index = ((char *) target - (char *) map_elem->ptr) / region->align;
+    size_t nb = size / region->align;
+
+    _Atomic (tx_t) volatile* controls = (_Atomic (tx_t) volatile *) ((char *) map_elem->ptr + map_elem->size * 2) + index;
+
+    for (size_t i = 0; i < nb; ++i) {
+        tx_t previous = 0;
+        tx_t previously_read = 0 - tx;
+	if (!(atomic_compare_exchange_strong_explicit(controls + i, &previous, tx, memory_order_acquire,memory_order_relaxed) || previous == tx || atomic_compare_exchange_strong(controls + i, &previously_read, tx))) {
+		if (i > 1) {
+                memset((void *) controls, 0, (i - 1) * sizeof(tx_t));
+                atomic_thread_fence(memory_order_release);
+            }
+            return false;
+        }
+    }
+    return true;
+}
 
 
 
-
+	
