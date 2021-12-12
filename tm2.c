@@ -140,11 +140,10 @@ shared_t tm_create(size_t size, size_t align){
 	region->map_elem->size=size;
 
 	if (unlikely(posix_memalign(&(region->map_elem->ptr), align_real, 2 * size + control_size) != 0)) {
-        free(region->map_elem);
-        free(region);
-        return invalid_shared;
+        	free(region->map_elem);
+        	free(region);
+        	return invalid_shared;
 	}
-
 
 	//initialize the remaining values of region->map_elem->...
 
@@ -155,7 +154,7 @@ shared_t tm_create(size_t size, size_t align){
 	memset(region->map_elem->ptr, 0, 2 * size + control_size);
 	get_new_batcher(&(region->batcher));
 	return region;
-};
+}
 
 void tm_destroy(shared_t shared) {
 	struct region* region=(struct region*) shared;
@@ -170,7 +169,10 @@ void tm_destroy(shared_t shared) {
 
 struct map_elem* get_segment(struct region* region,const void* source) {
    //I am looking for the map_elem which points to an area of memory which correspond to a piece of memory pointed by source*.
-    for (size_t i = 0;i < region->index;++i) {
+    for (size_t i = 0;i < region->index;i++) {
+	if (unlikely(region->map_elem[i].my_status == destroy_tx)) {
+            return NULL;
+        }
         char* start = (char*) region->map_elem[i].ptr;
         if ((char*) source >= start && (char*) source < start + region->map_elem[i].size) {
                 //if source points a memory area between the pointer of the map_elem block and its endind ()
@@ -180,16 +182,16 @@ struct map_elem* get_segment(struct region* region,const void* source) {
     return NULL;
 }
 
-void *tm_start(shared_t shared){
-    return ((struct region*)shared)->map_elem->ptr;
-}
-
 size_t tm_size(shared_t shared){
     return ((struct region*)shared)->map_elem->size;
 }
 
 size_t tm_align(shared_t shared){
     return ((struct region*)shared)->align_real;
+}
+
+void *tm_start(shared_t shared){
+    return ((struct region*)shared)->map_elem->ptr;
 }
 
 tx_t enter(struct batcher *batcher, bool is_ro) {
@@ -216,6 +218,7 @@ chance to take advantage of their full runtime quantum
             		//spinning locks again
 			while (atomic_load_explicit(&(batcher->permission),memory_order_relaxed) != attempt)
                 		pause();
+			//begin, acquire
             		atomic_thread_fence(memory_order_acquire);
 			if (atomic_load_explicit(&(batcher->counter),memory_order_relaxed) == 0) {
                 	unsigned long int epoch = atomic_load_explicit(&(batcher->epoch), memory_order_relaxed);
@@ -245,7 +248,7 @@ tx_t tm_begin(shared_t shared,bool is_ro){
 
 void commit(struct region *region) {
         atomic_thread_fence(memory_order_acquire);
-        for (size_t i = region->index - 1ul; i < region->index; --i) {
+        for (size_t i = region->index - 1ul; i < region->index; i--) {
         struct map_elem *map_elem = region->map_elem + i;
 
         if (map_elem->my_status == destroy_tx ||
@@ -257,9 +260,9 @@ void commit(struct region *region) {
             unsigned long int previous = i + 1;
             if (atomic_compare_exchange_weak(&(region->index), &previous, i)) {
                 free(map_elem->ptr);
-                map_elem->ptr = NULL;
                 map_elem->status = DEFAULT;
                 map_elem->my_status = 0;
+		map_elem->ptr = NULL;
             } else {
                 map_elem->my_status = destroy_tx;
                 map_elem->status = DEFAULT;
@@ -284,9 +287,14 @@ alloc_t tm_alloc(shared_t shared,tx_t tx,size_t size, void** target){
         unsigned long int index=atomic_fetch_add_explicit(&(region->index),1,memory_order_relaxed);
         struct map_elem* map_elem=region->map_elem+index;
         map_elem->status=ADDED;
-        map_elem->my_status=tx;  //set tx a the transaction to use
+        map_elem->size=size;
+	map_elem->my_status=tx;  //set tx a the transaction to use
         void* ptr=NULL;
-        memset(ptr,0,2*size+(size/(region->align_real)*sizeof(tx_t)));
+	size_t align_real=region->align_real;
+	size_t control_size=size/align_real*sizeof(tx_t);
+	if (unlikely(posix_memalign(&ptr, align_real, 2 * size + control_size) != 0))
+        	return nomem_alloc;
+        memset(ptr,0,2*size+control_size);
         map_elem->ptr=ptr;
         *target=ptr;
         return success_alloc;
@@ -318,10 +326,10 @@ void leave(struct batcher* batcher,struct region* region,tx_t tx) {
 
         	while (atomic_load_explicit(&(batcher->epoch), memory_order_relaxed) == epoch)
             		pause();
-    		} 
-		else {
-        		atomic_fetch_add_explicit(&(batcher->permission), 1, memory_order_release);
-    		}
+    	} 
+	else {
+   		atomic_fetch_add_explicit(&(batcher->permission), 1, memory_order_release);
+    	}
 	
 }
 
@@ -340,8 +348,8 @@ unsigned long int index = region->index;
             map_elem->my_status = destroy_tx;
         } else if (likely(owner != destroy_tx && map_elem->ptr != NULL)) {
                 if (owner == tx) {
-                map_elem->status = DEFAULT;
-                map_elem->my_status = 0;
+                    map_elem->status = DEFAULT;
+                    map_elem->my_status = 0;
             }
 
             size_t align = region->align;
@@ -349,7 +357,7 @@ unsigned long int index = region->index;
             size_t nb = map_elem->size / region->align;
             char *ptr = map_elem->ptr;
             _Atomic (tx_t) volatile *controls = (_Atomic (tx_t) volatile *) (ptr + 2 * size);
-            for (size_t j = 0; j < nb; ++j) {
+            for (size_t j = 0; j < nb; j++) {
                 if (controls[j] == tx) {
                     memcpy(ptr + j * align + size, ptr + j * align, align);
                     controls[j] = 0;
@@ -364,23 +372,21 @@ unsigned long int index = region->index;
     leave(&(region->batcher),region,tx);
 }
 
-bool tm_read_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target) {
+bool tm_read_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
     struct region* region = (struct region *) shared;
     struct map_elem* map_elem = get_segment(region, source);
     if (unlikely(map_elem == NULL)) {
-        // printf("Rollback in read !!!");
         tm_rollback(region, tx);
         return false;
     }
     size_t align = region->align_real;
     size_t index = ((char *) source - (char *) map_elem->ptr) / align;
-    size_t nb = size / align;
+    size_t num = size / align;
 
     _Atomic (tx_t) volatile *controls = ((_Atomic (tx_t) volatile *) (map_elem->ptr + map_elem->size * 2)) + index;
 
     atomic_thread_fence(memory_order_acquire);
-    // Read the data
-    for (size_t i = 0; i < nb; ++i) {
+    for (size_t i = 0; i < num; ++i) {
         tx_t no_owner = 0;
         tx_t owner = atomic_load(controls + i);
         if (owner == tx) {
@@ -411,10 +417,30 @@ bool tm_read(shared_t shared,tx_t tx,void const *source,size_t size,void *target
 	}
 }
 
+bool lock_words(struct region* region,tx_t tx,struct map_elem* map_elem, void* target, size_t size) {
+    size_t index = ((char *) target - (char *) map_elem->ptr) / region->align;
+    size_t nb = size / region->align;
+
+    _Atomic (tx_t) volatile* controls = (_Atomic (tx_t) volatile *) ((char *) map_elem->ptr + map_elem->size * 2) + index;
+
+    for (size_t i = 0; i < nb; i++) {
+        tx_t previous = 0;
+        tx_t previously_read = 0 - tx;
+        if (!(atomic_compare_exchange_strong_explicit(controls + i, &previous, tx, memory_order_acquire,memory_order_relaxed) || previous == tx || atomic_compare_exchange_strong(controls + i, &previously_read, tx))) {
+                if (i > 1) {
+                memset((void *) controls, 0, (i - 1) * sizeof(tx_t));
+                atomic_thread_fence(memory_order_release);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 bool tm_write(shared_t shared,tx_t tx,void const *source,size_t size,void *target){
 	struct region* region=(struct region*)shared;
 	struct map_elem* map_elem=get_segment(region,target);  //look for the specific map_elem according to the given target
-	if(map_elem==NULL){ 
+	if(map_elem==NULL || !lock_words(region, tx, map_elem, target, size)){ 
 		tm_rollback(region,tx);
 		return false;
 	}
@@ -438,27 +464,5 @@ bool tm_free(shared_t shared,tx_t tx,void *segment){
     }
     return true; //the transaction finished positively, can go on
 }
-
-bool lock_words(struct region* region,tx_t tx,struct map_elem*map_elem, void* target, size_t size) {
-    size_t index = ((char *) target - (char *) map_elem->ptr) / region->align;
-    size_t nb = size / region->align;
-
-    _Atomic (tx_t) volatile* controls = (_Atomic (tx_t) volatile *) ((char *) map_elem->ptr + map_elem->size * 2) + index;
-
-    for (size_t i = 0; i < nb; ++i) {
-        tx_t previous = 0;
-        tx_t previously_read = 0 - tx;
-	if (!(atomic_compare_exchange_strong_explicit(controls + i, &previous, tx, memory_order_acquire,memory_order_relaxed) || previous == tx || atomic_compare_exchange_strong(controls + i, &previously_read, tx))) {
-		if (i > 1) {
-                memset((void *) controls, 0, (i - 1) * sizeof(tx_t));
-                atomic_thread_fence(memory_order_release);
-            }
-            return false;
-        }
-    }
-    return true;
-}
-
-
 
 	
