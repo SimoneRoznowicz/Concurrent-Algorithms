@@ -130,19 +130,29 @@ shared_t tm_create(size_t size, size_t align){
 		return invalid_shared;
 	}
 	region->index=1; //index 0 memory isi reserved
+	size_t align_real=align<sizeof(void*) ? sizeof(void*) : align; //see documentation received
+	size_t control_size=size/align_real * sizeof(tx_t);
 	region->map_elem=malloc(getpagesize());
-	memset(region->map_elem,0,getpagesize());
 	if(unlikely(region->map_elem==NULL)){
 		return invalid_shared;
 	}
-	size_t align_real=align > sizeof(void*)? align : sizeof(void*);//boh questo non so... Io terrei anche solo align
+	memset(region->map_elem,0,getpagesize());
+	region->map_elem->size=size;
+
+	if (unlikely(posix_memalign(&(region->map_elem->ptr), align_real, 2 * size + control_size) != 0)) {
+        free(region->map_elem);
+        free(region);
+        return invalid_shared;
+	}
+
 
 	//initialize the remaining values of region->map_elem->...
-	region->map_elem->size=size;
+
 	region->map_elem->my_status=0;
 	region->map_elem->status=DEFAULT;
 	region->align_real=align_real;
 	region->align=align;
+	memset(region->map_elem->ptr, 0, 2 * size + control_size);
 	get_new_batcher(&(region->batcher));
 	return region;
 };
