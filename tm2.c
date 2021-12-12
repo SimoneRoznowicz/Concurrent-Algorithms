@@ -161,9 +161,13 @@ shared_t tm_create(size_t size, size_t align){
 
 void tm_destroy(shared_t shared) {
 	(struct region)* region=(struct region*) shared;
-	for(int i=0;i<region->map_elem;i++){
+	for(size_t i=0;i<region->index;i++){
 		free(region->map_elem[i].ptr);
 	}
+	free(region->map_elem);
+	//should I free batcher?
+	free(region);
+
 }
 
 void *tm_start(shared_t shared){
@@ -281,6 +285,89 @@ void leave((struct batcher)* batcher, (struct region)* region, tx_t tx) {
         		atomic_fetch_add_explicit(&(batcher->pass), 1ul, memory_order_release);
     		}
 	}
+}
+
+void batch_commit(struct region *region) {
+	atomic_thread_fence(memory_order_acquire);
+	for (size_t i = region->index - 1ul; i < region->index; --i) {
+        struct mapping_entry *mapping = region->mapping + i;
+
+        if (mapping->status_owner == destroy_tx ||
+            (mapping->status_owner != 0 && (
+                    mapping->status == REMOVED_FLAG || mapping->status == ADDED_REMOVED_FLAG)
+            )
+                ) {
+            // Free this block
+            unsigned long int previous = i + 1;
+	    if (atomic_compare_exchange_weak(&(region->index), &previous, i)) {
+                free(mapping->ptr);
+                mapping->ptr = NULL;
+                mapping->status = DEFAULT_FLAG;
+                mapping->status_owner = 0;
+            } else {
+                mapping->status_owner = destroy_tx;
+                mapping->status = DEFAULT_FLAG;
+            }
+	    } else {
+            mapping->status_owner = 0;
+            mapping->status = DEFAULT_FLAG;
+
+            // Commit changes
+            memcpy(mapping->ptr, ((char *) mapping->ptr) + mapping->size, mapping->size);
+
+            // Reset locks
+            memset(((char *) mapping->ptr) + 2 * mapping->size, 0, mapping->size / region->align * sizeof(tx_t));
+        }
+    }
+    atomic_thread_fence(memory_order_release);
+}
+
+struct map_elem* get_segment((struct region)* region,const void* source) {
+   //I am looking for the map_elem which points to an area of memory which correspond to a piece of memory pointed by source*. 
+    for (size_t i = 0;i < region->index;++i) {
+        char* start = (char*) region->map_elem[i].ptr;
+        if ((char*) source >= start && (char*) source < start + region->mapping[i].size) {
+		//if source points a memory area between the pointer of the map_elem block and its endind ()
+		return region->map_elem+i;
+	}
+    } 
+    return NULL;
+}
+
+alloc_t tm_alloc(shared_t shared,tx_t tx,size_t size, void** target){
+	(struct region)* region=((struct region)*)shared;
+	//increment index,create a pointer to the next available area of memmory  and set the variables of that map_element
+	unsigned long int index=atomic_fetch_add_explicit((&(region->index,)),memory_order_relaxed);
+	struct map_elem* map_elem=region->map_elem+index;
+	map_elem->status=ADDED;
+	map_elem->my_status=tx;  //set tx a the transaction to use
+	
+	memset(ptr,0,2*size+(size/(region->align_real)*sizeof(tx_t)));
+	map_elem->ptr=ptr;
+	*target=ptr;
+	return success_alloc;
+}
+
+bool tm_read(shared_t shared,tx_t tx,void const *source,size_t size,void *target){
+	if(tx==read_only_tx){	//read only, easy xcase
+		memcpy(target,source,size);  //now target contains what is pointed by the source
+		return true;
+	}
+	else{
+		//DO SOMETHING 	
+	}
+}
+
+bool tm_write(shared_t shared,tx_t tx,void const *source,size_t size,void *target){
+	(struct region)* region=((struct region)*)shared;
+	struct map_elem* map_elem=get_elem(region,target);  //look for the specific map_elem according to the given target
+	if(map_elem==NULL){ 
+		tm_rollback(region,tx);
+		return false;
+	}
+	size_t offset=map_elem->size;
+	memcpy((char*) target+offset,source,size);
+	return true;
 }
 
 
