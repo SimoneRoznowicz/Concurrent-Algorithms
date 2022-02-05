@@ -13,7 +13,7 @@
 //#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h> //TODO: REMOVE FOR DEBUG PURPOSES
+#include <stdio.h> 
 
 
 #if (defined(__i386__) || defined(__x86_64__)) && defined(USE_MM_PAUSE)
@@ -67,25 +67,37 @@
 
 // -------------------------------------------------------------------------- //
 
-
+/*
+Spinning locks instead of mutex locks?
+The problem with mutexes is that putting threads to sleep and waking them up again are both rather expensive 
+operations, they'll need quite a lot of CPU instructions and thus also take some time.
+On a multi-core/multi-CPU systems, with plenty of locks that are held for a very short amount
+of time only, the time wasted for constantly putting threads to sleep and waking them up again 
+might decrease runtime performance noticeably. When using spinlocks instead, threads get the 
+chance to take advantage of their full runtime quantum (always only blocking for a very short time 
+period, but then immediately continue their work), leading to much higher processing throughput.
+Here about 10 cores are being used!
+https://stackoverflow.com/questions/5869825/when-should-one-use-a-spinlock-instead-of-mutex
+*/
 // Pause for few cycles.
 
 static inline void pause() {
 #if (defined(__i386__) || defined(__x86_64__)) && defined(USE_MM_PAUSE)
 	_mm_pause();
 #else
-	sched_yield();sched_yield();sched_yield();sched_yield();
+	sched_yield();
 #endif
 }
 
 // -------------------------------------------------------------------------- //
 
+//state variables
 #define DEFAULT 0
 #define REMOVED 1
 #define ADDED 2
 #define ADDED_REMOVED 3
 
-#define BATCHER_NB_TX 1
+#define BATCHER_NB_TX 10
 #define MULTIPLE_READERS UINTPTR_MAX - BATCHER_NB_TX
 
 static const tx_t read_only_tx = UINTPTR_MAX - 1;
@@ -98,6 +110,7 @@ struct map_elem{
 	_Atomic (int) status;
 };
 
+
 struct batcher{
 	atomic_ulong counter;
 	atomic_ulong num_entered_proc;
@@ -107,6 +120,8 @@ struct batcher{
 	atomic_ulong permission;
 };
 
+//basic struct which handles everything. It contains an instance of the batcher,
+//useful to handle the entrance of the threads in the critical zones
 struct region{
 	size_t align;
 	size_t align_real;
@@ -115,6 +130,7 @@ struct region{
 	struct map_elem* map_elem;	//array of map_elem
 };
 
+//initialize a new batcher setting all the values to 0
 void get_new_batcher(struct batcher* batcher){
 	batcher->counter=BATCHER_NB_TX;
 	batcher->num_entered_proc=0;
@@ -124,18 +140,20 @@ void get_new_batcher(struct batcher* batcher){
 	batcher->permission=0;
 }
 
-shared_t tm_create(size_t size, size_t align){
 
+shared_t tm_create(size_t size, size_t align){
 	struct region *region = (struct region *) malloc(sizeof(struct region));
 	size_t align_real = align < sizeof(void *) ? sizeof(void *) : align;
 	size_t control_size = size / align_real * sizeof(tx_t);
-
+	
 	region->index = 1;
 	region->map_elem = malloc(getpagesize());
 	memset(region->map_elem, 0, getpagesize());
 	region->map_elem->size = size;
+	//set initial default status
 	region->map_elem->status = DEFAULT;
 	region->map_elem->my_status = 0;
+	//align and reserve space for control and two copies
 	posix_memalign(&(region->map_elem->ptr), align_real, 2 * size + control_size);
 	get_new_batcher(&(region->batcher));
 	memset(region->map_elem->ptr, 0, 2 * size + control_size);
@@ -145,6 +163,7 @@ shared_t tm_create(size_t size, size_t align){
 	return region;
 }
 
+//free memory of region: first remove all the memory pointed by map_elem, then free the memory occupied by region
 void tm_destroy(shared_t shared) {
 	struct region* region=(struct region*) shared;
 	for(size_t i=0;i<region->index;i++){
@@ -154,12 +173,14 @@ void tm_destroy(shared_t shared) {
 	free(region);
 }
 
+//This function returns the portion of memory that should be considered while reading/writing 
 struct map_elem* get_segment(struct region* region,const void* source) {
 	//I am looking for the map_elem which points to an area of memory which correspond to a piece of memory pointed by source*.
 	for (size_t i = 0;i < region->index;i++) {
 		char* start = (char*) region->map_elem[i].ptr;
 		if ((char*) source >= start && (char*) source < start + region->map_elem[i].size) {
-			//if source points a memory area between the pointer of the map_elem block and its endind ()
+			//look for the right pointer: i.e. for the one pointing at the same block of memory also pointed by start 
+			//if source points to a memory area between the start of the memory area pointed by ptr (owned by a specific map_elem[i]) and its end:
 			return region->map_elem+i;
 		}
 	}
@@ -179,7 +200,7 @@ void *tm_start(shared_t shared){
 }
 
 tx_t enter(struct batcher *batcher, bool is_ro) {
-	if(is_ro){
+	if(is_ro){  //threads just read
 		unsigned long attempt=atomic_fetch_add_explicit(&(batcher->acquire_lock),1ul,memory_order_relaxed);/*On a multi-core/multi-CPU systems, with plenty of locks that are held for a very short amount of time only, the time wasted for constantly putting threads to sleep and waking them up again might decrease runtime performance noticeably. When using spinlocks instead, threads get the  chance to take advantage of their full runtime quantum*/
 		//keep iterating until the value of the obtained attempt corresponds to the pass
 		while(batcher->permission!=attempt)
@@ -194,6 +215,7 @@ tx_t enter(struct batcher *batcher, bool is_ro) {
 			//spinning locks again
 			while(batcher->permission!=attempt)
 				pause();
+			
 			if (batcher->counter == 0) {
 				unsigned long int epoch = batcher->epoch;
 				atomic_fetch_add_explicit(&(batcher->permission),1,memory_order_relaxed);
@@ -201,6 +223,7 @@ tx_t enter(struct batcher *batcher, bool is_ro) {
 				while(batcher->epoch==epoch)
 					pause();
 			}
+			//If I can enter, then I enter and then update the state values according to a new entrance
 			else {
 				atomic_fetch_add_explicit(&(batcher->counter),-1,memory_order_relaxed);
 				break;
@@ -221,11 +244,13 @@ tx_t tm_begin(shared_t shared,bool is_ro){
 void commit(struct region *region) {
 	for (size_t i = region->index - 1; i < region->index; i--) {
 		struct map_elem *map_elem = region->map_elem + i;
-
+		
+		//decide here whether the specified block is to be committed or not
 		if (map_elem->my_status == destroy_tx ||(map_elem->my_status != 0 && (map_elem->status == REMOVED || map_elem->status == ADDED_REMOVED))) {
-			// Free this block
+			//free this block
 			unsigned long int previous = i + 1;
 			if (atomic_compare_exchange_weak(&(region->index), &previous, i)) {
+				//free and reset original values
 				free(map_elem->ptr);
 				map_elem->status = DEFAULT;
 				map_elem->my_status = 0;
@@ -237,13 +262,14 @@ void commit(struct region *region) {
 			}
 		} 
 		else {
+			//reset original status values and commit
 			map_elem->my_status = 0;
 			map_elem->status = DEFAULT;
 
-			// Commit changes
+			//Commit changes
 			memcpy(map_elem->ptr, ((char *) map_elem->ptr) + map_elem->size, map_elem->size);
 
-			// Reset locks
+			//Reset locks
 			memset(((char *) map_elem->ptr) + 2 * map_elem->size, 0, map_elem->size / region->align * sizeof(tx_t));
 		}
 	}
@@ -251,16 +277,18 @@ void commit(struct region *region) {
 
 alloc_t tm_alloc(shared_t shared,tx_t tx,size_t size, void** target){
 	struct region* region=(struct region*)shared;
-	//increment index,create a pointer to the next available area of memmory  and set the variables of that map_element
+	//increment index, create a pointer to the next available area of memmory and set the variables of that map_element
 	unsigned long int index=atomic_fetch_add_explicit(&(region->index),1,memory_order_relaxed);
 	struct map_elem* map_elem=region->map_elem+index;
 	map_elem->status=ADDED;
 	map_elem->size=size;
 	map_elem->my_status=tx;  //set tx a the transaction to use
-	void* ptr=NULL;
 	size_t align_real=region->align_real;
-	size_t control_size=size/align_real*sizeof(tx_t);
-	posix_memalign(&ptr, align_real, 2 * size + control_size);
+        size_t control_size=size/align_real*sizeof(tx_t);
+	void* ptr=NULL;
+	if (unlikely(posix_memalign(&ptr, align_real, 2 * size + control_size) != 0))
+        	return nomem_alloc;
+	//set space memory for control and 2 copies
 	memset(ptr,0,2*size+control_size);
 	map_elem->ptr=ptr;
 	*target=ptr;
@@ -284,8 +312,9 @@ void leave(struct batcher* batcher,struct region* region,tx_t tx) {
 		}
 		atomic_fetch_add_explicit(&(batcher->permission),1,memory_order_relaxed);
 	}
+	//similar to what was int enter
 	else if(tx!=read_only_tx){
-		unsigned long int epoch= batcher->epoch;
+		unsigned long int epoch = batcher->epoch;
 		atomic_fetch_add_explicit(&(batcher->permission), 1, memory_order_relaxed);
 		while(batcher->epoch==epoch)
 			pause();
