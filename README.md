@@ -1,5 +1,8 @@
 # CS-453 - Course project
 
+The project was done within the course Concurrent Algorithms offered at the *School of Computer and Communication Sciences* at École polytechnique fédérale de Lausanne (EPFL).
+The final reached performance is *x3.5* (*x2.5* was enough to get the highest grade).
+
 The [project description](https://dcl.epfl.ch/site/_media/education/ca-project.pdf) is available on [Moodle](https://moodle.epfl.ch/course/view.php?id=14334) and the [website of the course](https://dcl.epfl.ch/site/education/ca_2021).
 
 The description includes:
