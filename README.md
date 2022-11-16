@@ -1,4 +1,4 @@
-# CS-453 - Course project
+# Efficient Payment Transactions
 
 The project was done within the course Concurrent Algorithms offered at the *School of Computer and Communication Sciences* at École polytechnique fédérale de Lausanne (EPFL).
 The final reached performance is *x3.5* (*x2.5* was enough to get the highest grade).
